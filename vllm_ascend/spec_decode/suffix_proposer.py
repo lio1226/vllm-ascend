@@ -40,6 +40,6 @@ class SuffixDecodingProposer(VllmSuffixDecodingProposer, Proposer):
                            num_scheduled_tokens=None,
                            hidden_states=None,
                            aux_hidden_states=None) -> list[list[int]]:
-        draft_token_ids = self.propose(self.runner.input_batch,
+        draft_token_ids, results = self.propose(self.runner.input_batch,
                                        valid_sampled_token_ids)
-        return draft_token_ids
+        return draft_token_ids, results

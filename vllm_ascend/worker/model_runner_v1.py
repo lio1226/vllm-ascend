@@ -72,6 +72,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+from vllm.v1.spec_decode.arctic import ArcticProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.worker.gpu_model_runner import (AsyncGPUModelRunnerOutput,
                                              GPUModelRunner)
@@ -364,6 +365,10 @@ class NPUModelRunner(GPUModelRunner):
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
+
+        if self.speculative_config and self.speculative_config.enable_suffix_decoding:
+            self.suffix_processor = get_spec_decode_method("suffix", self.vllm_config, 
+                                                    self.device, self)
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1312,6 +1317,58 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices=logits_indices,
         )
 
+    def propose_arctic_draft_token_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: list[list[int]],
+        previous_hidden_states: Optional[torch.Tensor] = None,
+    ) -> list[list[int]]:
+        last_tokens: list[int] = []
+        max_spec_tokens = self.speculative_config.num_speculative_tokens
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+
+            if (num_sampled_ids == 0):
+                if self.speculative_config.enable_suffix_decoding:
+                    return [[]] * len(sampled_token_ids)
+                req_id = self.input_batch.req_ids[i]
+                req_state = self.requests[req_id]
+                seq_len = (req_state.num_computed_tokens +
+                           scheduler_output.num_scheduled_tokens[req_id])
+                sampled_ids = [req_state.get_token_id(seq_len)]
+
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + num_sampled_ids
+
+            max_spec_tokens = min(
+                max_spec_tokens,
+                self.max_model_len - end_idx - 1,
+            )
+            if max_spec_tokens <= 0:
+                continue
+
+            self.input_batch.token_ids_cpu[i,
+                                           start_idx:end_idx] = sampled_ids[-1]
+            last_tokens.append(self.input_batch.token_ids_cpu[i, end_idx - 1])
+
+        if max_spec_tokens <= 0:
+            return [[] for _ in sampled_token_ids]
+
+        drafter_output = self.drafter.propose(
+            last_tokens,
+            previous_hidden_states=previous_hidden_states,
+            num_predict_tokens=max_spec_tokens,
+        )
+
+        draft_token_ids = drafter_output.tolist()
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not sampled_ids:
+                draft_token_ids[i] = []
+
+        return draft_token_ids
+
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
@@ -1324,17 +1381,56 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states: torch.Tensor,
         attn_metadata: dict[str, Any],
         aux_hidden_states: torch.Tensor = None,
+        original_sampled_token_ids: np.ndarray = None,
+        sample_hidden_states: torch.Tensor = None,
     ) -> Optional[list[list[int]]]:
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
             if self.speculative_config.method in ("suffix", "ngram"):
-                draft_token_ids = self.drafter.generate_token_ids(
+                draft_token_ids, _ = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata,
                     scheduler_output, spec_decode_metadata, positions,
                     num_scheduled_tokens, hidden_states, aux_hidden_states)
 
+            elif self.speculative_config.method == "arctic":
+                suffix_spec_token_ids = None
+                new_sampled_token_ids = valid_sampled_token_ids.copy()
+                if self.speculative_config.enable_suffix_decoding:
+                    _, results = self.suffix_processor.generate_token_ids(
+                        valid_sampled_token_ids, sampling_metadata,
+                        scheduler_output, spec_decode_metadata, positions,
+                        num_scheduled_tokens, hidden_states, aux_hidden_states)
+                    suffix_spec_token_ids = []
+                    min_score = self.speculative_config.num_speculative_tokens
+                    for i, result in enumerate(results):
+                        if result.score >= min_score:
+                            # Use suffix decoded tokens, disable other speculation
+                            # methods for this request.
+                            new_sampled_token_ids[i] = []
+                            suffix_spec_token_ids.append(result.token_ids)
+                        else:
+                            suffix_spec_token_ids.append([])
+                spec_token_ids = None
+                assert isinstance(self.drafter, ArcticProposer)
+                previous_hidden_states = self.drafter.prepare_hidden_states(
+                    sample_hidden_states=sample_hidden_states,
+                    sampled_token_ids=original_sampled_token_ids,
+                    spec_decode_metadata=spec_decode_metadata,
+                )
+                spec_token_ids = self.propose_arctic_draft_token_ids(
+                    scheduler_output,
+                    new_sampled_token_ids,
+                    previous_hidden_states=previous_hidden_states)
+                
+                if spec_token_ids is None:
+                    draft_token_ids = suffix_spec_token_ids
+                elif suffix_spec_token_ids is not None:
+                    draft_token_ids = [
+                        suffix_spec_token_ids[i] or spec_token_ids[i]
+                        for i in range(len(suffix_spec_token_ids))
+                    ] 
             elif self.speculative_config.use_eagle():
                 common_attn_metadata = self.spec_decode_common_attn_metadata
                 sampled_token_ids = valid_sampled_token_ids
@@ -1716,6 +1812,8 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states,
                 attn_metadata,
                 aux_hidden_states,
+                sampler_output.sampled_token_ids,
+                sample_hidden_states,
             )
 
         (
