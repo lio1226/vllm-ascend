@@ -1424,13 +1424,16 @@ class NPUModelRunner(GPUModelRunner):
                     new_sampled_token_ids,
                     previous_hidden_states=previous_hidden_states)
                 
-                if spec_token_ids is None:
-                    draft_token_ids = suffix_spec_token_ids
-                elif suffix_spec_token_ids is not None:
+                if spec_token_ids is not None and suffix_spec_token_ids is not None:
                     draft_token_ids = [
                         suffix_spec_token_ids[i] or spec_token_ids[i]
                         for i in range(len(suffix_spec_token_ids))
-                    ] 
+                    ]
+                elif suffix_spec_token_ids is not None:
+                    draft_token_ids = suffix_spec_token_ids
+                elif spec_token_ids is not None:
+                    draft_token_ids = spec_token_ids
+                    
             elif self.speculative_config.use_eagle():
                 common_attn_metadata = self.spec_decode_common_attn_metadata
                 sampled_token_ids = valid_sampled_token_ids
